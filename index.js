@@ -34,14 +34,12 @@ function ensureFilesExist() {
 
 ensureFilesExist();
 
-// Check if string is a raw IP address, and if so, whether it is private/internal
 function isPrivateIpString(ipStr) {
   try {
     const addr = ipaddr.parse(ipStr);
     return addr.range() !== 'unicast';
   } catch (e) {
-    // Not a literal IP address (it's a domain name like example.com)
-    return false; 
+    return false; // Hostname string (e.g. example.com), not an IP
   }
 }
 
@@ -50,21 +48,22 @@ function handleReadFile(filePath) {
     return { action: 'block', reason: 'Invalid path parameter' };
   }
 
-  // Handle URL decoding if encoded sequences were sent (%2e%2e)
-  let cleanPath = filePath;
-  try {
-    cleanPath = decodeURIComponent(filePath);
-  } catch (e) {
-    // keep raw if not decodable
+  // Preserve absolute sandbox paths; strip leading slash for sandbox-relative paths
+  let targetPath = filePath;
+  if (!targetPath.startsWith(SANDBOX_ROOT) && targetPath.startsWith('/')) {
+    targetPath = targetPath.replace(/^\/+/, '');
   }
 
-  const resolvedPath = path.resolve(SANDBOX_ROOT, cleanPath);
+  // Resolve path relative to sandbox root
+  const resolvedPath = path.resolve(SANDBOX_ROOT, targetPath);
   const rootWithSep = SANDBOX_ROOT.endsWith(path.sep) ? SANDBOX_ROOT : SANDBOX_ROOT + path.sep;
 
+  // Verify path containment
   if (resolvedPath !== SANDBOX_ROOT && !resolvedPath.startsWith(rootWithSep)) {
     return { action: 'block', reason: 'Path outside sandbox directory' };
   }
 
+  // Resolve realpath to handle symlinks and verify actual file existence
   try {
     const realPath = fs.realpathSync(resolvedPath);
     if (realPath !== SANDBOX_ROOT && !realPath.startsWith(rootWithSep)) {
@@ -90,45 +89,39 @@ async function handleFetchUrl(rawUrl, redirectDepth = 0) {
     return { action: 'block', reason: 'Invalid URL format' };
   }
 
-  // Only http and https allowed
   if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
     return { action: 'block', reason: 'Unsupported protocol' };
   }
 
-  // Block Userinfo confusion (http://user:pass@example.com)
   if (parsedUrl.username || parsedUrl.password) {
     return { action: 'block', reason: 'Userinfo in URL prohibited' };
   }
 
   const hostname = parsedUrl.hostname.toLowerCase();
 
-  // 1. Strict Host Check against exact allowed set
   if (!ALLOWED_HOSTS.has(hostname)) {
     return { action: 'block', reason: 'Host not in allowed domain list' };
   }
 
-  // 2. IP check (only blocks literal private/loopback IP addresses)
   if (isPrivateIpString(hostname)) {
     return { action: 'block', reason: 'Private IP target prohibited' };
   }
 
-  // 3. Perform Fetch with Redirect Handling
   return new Promise((resolve) => {
     const client = parsedUrl.protocol === 'https:' ? https : http;
-    
+
     const requestOptions = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Guardrail-Agent/1.0'
+        'User-Agent': 'Mozilla/5.0 Guardrail-Agent/1.0'
       },
       timeout: 5000
     };
 
     const req = client.request(requestOptions, (res) => {
-      // Handle redirects securely
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         const nextUrl = new URL(res.headers.location, parsedUrl.href).href;
         return resolve(handleFetchUrl(nextUrl, redirectDepth + 1));
@@ -137,12 +130,7 @@ async function handleFetchUrl(rawUrl, redirectDepth = 0) {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
-        // Return result in clean structure compliant with grader contract
-        resolve({
-          action: 'allow',
-          reason: 'URL allowed',
-          result: data
-        });
+        resolve({ action: 'allow', reason: 'URL allowed', result: data });
       });
     });
 
