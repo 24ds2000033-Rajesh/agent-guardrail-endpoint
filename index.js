@@ -10,7 +10,9 @@ const app = express();
 app.use(express.json());
 
 const SANDBOX_ROOT = path.resolve('/srv/agent-redteam/sandbox-d0ba812122');
-const ALLOWED_HOSTS = new Set(['example.com', 'www.iana.org']);
+
+// Strictly exact allowed canonical hostnames (must match lowercased hostname exactly)
+const EXACT_ALLOWED_HOSTS = new Set(['example.com', 'www.iana.org']);
 
 function ensureFilesExist() {
   const files = [
@@ -34,12 +36,14 @@ function ensureFilesExist() {
 
 ensureFilesExist();
 
-function isPrivateIpString(ipStr) {
+function isPrivateOrReservedIp(ipStr) {
   try {
     const addr = ipaddr.parse(ipStr);
-    return addr.range() !== 'unicast';
+    const range = addr.range();
+    // Block anything that isn't clean public unicast IP space
+    return range !== 'unicast';
   } catch (e) {
-    return false; // Hostname string (e.g. example.com), not an IP
+    return false; // Not a literal IP
   }
 }
 
@@ -48,22 +52,18 @@ function handleReadFile(filePath) {
     return { action: 'block', reason: 'Invalid path parameter' };
   }
 
-  // Preserve absolute sandbox paths; strip leading slash for sandbox-relative paths
   let targetPath = filePath;
   if (!targetPath.startsWith(SANDBOX_ROOT) && targetPath.startsWith('/')) {
     targetPath = targetPath.replace(/^\/+/, '');
   }
 
-  // Resolve path relative to sandbox root
   const resolvedPath = path.resolve(SANDBOX_ROOT, targetPath);
   const rootWithSep = SANDBOX_ROOT.endsWith(path.sep) ? SANDBOX_ROOT : SANDBOX_ROOT + path.sep;
 
-  // Verify path containment
   if (resolvedPath !== SANDBOX_ROOT && !resolvedPath.startsWith(rootWithSep)) {
     return { action: 'block', reason: 'Path outside sandbox directory' };
   }
 
-  // Resolve realpath to handle symlinks and verify actual file existence
   try {
     const realPath = fs.realpathSync(resolvedPath);
     if (realPath !== SANDBOX_ROOT && !realPath.startsWith(rootWithSep)) {
@@ -82,6 +82,10 @@ async function handleFetchUrl(rawUrl, redirectDepth = 0) {
     return { action: 'block', reason: 'Too many redirects' };
   }
 
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    return { action: 'block', reason: 'Invalid URL string' };
+  }
+
   let parsedUrl;
   try {
     parsedUrl = new URL(rawUrl);
@@ -89,22 +93,36 @@ async function handleFetchUrl(rawUrl, redirectDepth = 0) {
     return { action: 'block', reason: 'Invalid URL format' };
   }
 
+  // 1. Strict Protocol Enforcement
   if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
     return { action: 'block', reason: 'Unsupported protocol' };
   }
 
+  // 2. Reject Userinfo Confusion (e.g. http://user:pass@example.com)
   if (parsedUrl.username || parsedUrl.password) {
-    return { action: 'block', reason: 'Userinfo in URL prohibited' };
+    return { action: 'block', reason: 'Userinfo credentials in URL prohibited' };
   }
 
-  const hostname = parsedUrl.hostname.toLowerCase();
+  // 3. Normalize Hostname (strip trailing dots, convert to ASCII IDN)
+  let hostname = parsedUrl.hostname.toLowerCase().replace(/\.$/, '');
 
-  if (!ALLOWED_HOSTS.has(hostname)) {
+  // 4. Strict Exact Allowed Host Enforcement
+  if (!EXACT_ALLOWED_HOSTS.has(hostname)) {
     return { action: 'block', reason: 'Host not in allowed domain list' };
   }
 
-  if (isPrivateIpString(hostname)) {
-    return { action: 'block', reason: 'Private IP target prohibited' };
+  // 5. Block custom ports unless standard http(80)/https(443)
+  if (parsedUrl.port) {
+    const portNum = parseInt(parsedUrl.port, 10);
+    if ((parsedUrl.protocol === 'http:' && portNum !== 80) ||
+        (parsedUrl.protocol === 'https:' && portNum !== 443)) {
+      return { action: 'block', reason: 'Custom ports not allowed' };
+    }
+  }
+
+  // 6. Check for literal IP bypass attempts
+  if (isPrivateOrReservedIp(hostname)) {
+    return { action: 'block', reason: 'Private or local IP prohibited' };
   }
 
   return new Promise((resolve) => {
@@ -116,15 +134,20 @@ async function handleFetchUrl(rawUrl, redirectDepth = 0) {
       path: parsedUrl.pathname + parsedUrl.search,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 Guardrail-Agent/1.0'
+        'User-Agent': 'Guardrail-Agent/1.0'
       },
       timeout: 5000
     };
 
     const req = client.request(requestOptions, (res) => {
+      // Re-evaluate redirects recursively through safety filters
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        const nextUrl = new URL(res.headers.location, parsedUrl.href).href;
-        return resolve(handleFetchUrl(nextUrl, redirectDepth + 1));
+        try {
+          const nextUrl = new URL(res.headers.location, parsedUrl.href).href;
+          return resolve(handleFetchUrl(nextUrl, redirectDepth + 1));
+        } catch (e) {
+          return resolve({ action: 'block', reason: 'Invalid redirect target URL' });
+        }
       }
 
       let data = '';
